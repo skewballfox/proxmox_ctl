@@ -20,7 +20,7 @@ ssh_target      := pve_user + "@" + pve_host
 talos_version := env('TALOS_VERSION', '') || '1.13.0'
 talos_storage := env('TALOS_STORAGE', '') || 'local-lvm'
 talos_bridge  := env('TALOS_BRIDGE',  '') || 'vmbr0'
-talos_image   := env('TALOS_IMAGE',   '') || '/var/lib/vz/template/qcow2/talos-{{ talos_version }}.qcow2'
+talos_image   := env('TALOS_IMAGE',   '') || '/var/lib/vz/template/qcow2/talos-' + talos_version + '.qcow2'
 
 # Control plane defaults
 cp_cores  := env('TALOS_CP_CORES',  '') || '2'
@@ -39,6 +39,7 @@ worker_disk   := env('TALOS_WORKER_DISK',   '') || '100'
 # Validate required env vars and tool dependencies (used as a guard by other recipes)
 check:
     #!/usr/bin/env bash
+    set -euo pipefail
     errors=0
     [ -n "{{ pve_host }}" ]        || { echo "PVE_HOST is not set";       errors=$((errors+1)); }
     [ -n "{{ pve_user }}" ]        || { echo "PVE_USER is not set";       errors=$((errors+1)); }
@@ -59,11 +60,11 @@ _ssh +cmd:
 # -----------------------------
 
 # Create N control plane VMs, adding to any already in the cluster
-create-cp-vms count cores="{{ cp_cores }}" memory="{{ cp_memory }}" disk="{{ cp_disk }}": check
+create-cp-vms count cores=cp_cores memory=cp_memory disk=cp_disk: check
     just _create-vm-group "{{ count }}" "controlplane" "talos-{{ current_cluster }}-cp" "{{ cores }}" "{{ memory }}" "{{ disk }}"
 
 # Create N worker VMs, adding to any already in the cluster
-create-worker-vms count cores="{{ worker_cores }}" memory="{{ worker_memory }}" disk="{{ worker_disk }}": check
+create-worker-vms count cores=worker_cores memory=worker_memory disk=worker_disk: check
     just _create-vm-group "{{ count }}" "worker" "talos-{{ current_cluster }}-worker" "{{ cores }}" "{{ memory }}" "{{ disk }}"
 
 # Create all Talos VMs (control plane + workers)
@@ -72,20 +73,23 @@ create-vms count_cp count_workers: check
     just create-worker-vms "{{ count_workers }}"
 
 # Create a single control plane VM (vmid and name auto-assigned)
-create-cp cores="{{ cp_cores }}" memory="{{ cp_memory }}" disk="{{ cp_disk }}": check
+create-cp cores=cp_cores memory=cp_memory disk=cp_disk: check
     just _create-vm-group "1" "controlplane" "talos-{{ current_cluster }}-cp" "{{ cores }}" "{{ memory }}" "{{ disk }}"
 
 # Create a single worker VM (vmid and name auto-assigned)
-create-worker cores="{{ worker_cores }}" memory="{{ worker_memory }}" disk="{{ worker_disk }}": check
+create-worker cores=worker_cores memory=worker_memory disk=worker_disk: check
     just _create-vm-group "1" "worker" "talos-{{ current_cluster }}-worker" "{{ cores }}" "{{ memory }}" "{{ disk }}"
 
 [private]
 _create-vm-group count role name_prefix cores memory disk:
     #!/usr/bin/env bash
+    set -euo pipefail
+    prefix="{{ name_prefix }}"
+    prefix="${prefix//_/-}"
     base=$(just _vmids-by-role "{{ role }}" | wc -l | xargs)
     for i in $(seq 1 {{ count }}); do
         vmid=$(just next-id)
-        name=$(printf "{{ name_prefix }}-%02d" $((base + i)))
+        name=$(printf "%s-%02d" "$prefix" $((base + i)))
         echo "Creating $name (VMID $vmid)..."
         just _create-vm "$vmid" "$name" "{{ cores }}" "{{ memory }}" "{{ disk }}" "{{ role }}"
     done
@@ -93,36 +97,22 @@ _create-vm-group count role name_prefix cores memory disk:
 [private]
 _create-vm vmid name cores memory disk role:
     #!/usr/bin/env bash
-    if ssh {{ ssh_target }} "{{ sudo }} qm status {{ vmid }}" 2>/dev/null; then
+    set -euo pipefail
+    if just _ssh "qm status {{ vmid }}" &>/dev/null; then
         echo "VM {{ vmid }} ({{ name }}) already exists, skipping"
         exit 0
     fi
-
-    ssh {{ ssh_target }} bash <<'REMOTE'
-    set -euo pipefail
-
-    {{ sudo }} qm create {{ vmid }} \
-        --name {{ name }} \
-        --tags "talos,{{ role }},{{ current_cluster }}" \
-        --cpu host \
-        --cores {{ cores }} \
-        --memory {{ memory }} \
-        --scsihw virtio-scsi-pci \
-        --net0 virtio,bridge={{ talos_bridge }} \
-        --ostype l26 \
-        --agent enabled=1
-
-    {{ sudo }} qm importdisk {{ vmid }} {{ talos_image }} {{ talos_storage }}
-    {{ sudo }} qm set {{ vmid }} --scsi0 {{ talos_storage }}:vm-{{ vmid }}-disk-0
-    {{ sudo }} qm set {{ vmid }} --boot order=scsi0
-    {{ sudo }} qm resize {{ vmid }} scsi0 {{ disk }}G
-    REMOTE
-
+    just _ssh "qm create {{ vmid }} --name {{ name }} --tags talos,{{ role }},{{ current_cluster }} --cpu host --cores {{ cores }} --memory {{ memory }} --scsihw virtio-scsi-pci --net0 virtio,bridge={{ talos_bridge }} --ostype l26 --agent enabled=1"
+    just _ssh "qm importdisk {{ vmid }} {{ talos_image }} {{ talos_storage }}"
+    just _ssh "qm set {{ vmid }} --scsi0 {{ talos_storage }}:vm-{{ vmid }}-disk-0"
+    just _ssh "qm set {{ vmid }} --boot order=scsi0"
+    just _ssh "qm resize {{ vmid }} scsi0 {{ disk }}G"
     echo "Created VM {{ name }} ({{ vmid }})"
 
 # Start all Talos VMs in the current cluster
 start-vms: check
     #!/usr/bin/env bash
+    set -euo pipefail
     while IFS= read -r vmid; do
         echo "Starting VM $vmid..."
         just _ssh "qm start $vmid" || echo "VM $vmid may already be running"
@@ -131,6 +121,7 @@ start-vms: check
 # Stop all Talos VMs in the current cluster
 stop-vms: check
     #!/usr/bin/env bash
+    set -euo pipefail
     while IFS= read -r vmid; do
         echo "Stopping VM $vmid..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
@@ -139,6 +130,7 @@ stop-vms: check
 # Destroy all Talos VMs in the current cluster (stop + delete + purge disks)
 destroy-vms: check
     #!/usr/bin/env bash
+    set -euo pipefail
     while IFS= read -r vmid; do
         echo "Destroying VM $vmid..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
@@ -161,6 +153,7 @@ next-id: check
 [private]
 _vmids-by-role role="":
     #!/usr/bin/env bash
+    set -euo pipefail
     ssh {{ ssh_target }} bash <<'REMOTE'
     for vmid in $({{ sudo }} qm list | tail -n+2 | awk '{print $1}'); do
         tags=$({{ sudo }} qm config "$vmid" | grep -oP '^tags:\s*\K.*' || true)
@@ -182,6 +175,7 @@ count-workers: check
 # List all Talos-tagged VMs on the host
 list-vms: check
     #!/usr/bin/env bash
+    set -euo pipefail
     echo "Talos VMs on {{ pve_host }}:"
     ssh {{ ssh_target }} bash <<'REMOTE'
     all=$({{ sudo }} qm list)
@@ -195,6 +189,7 @@ list-vms: check
 # Show status of all cluster VMs
 status: check
     #!/usr/bin/env bash
+    set -euo pipefail
     printf "%-8s %-20s %-10s\n" "VMID" "NAME" "STATUS"
     printf "%-8s %-20s %-10s\n" "----" "----" "------"
     while IFS= read -r vmid; do
@@ -208,6 +203,7 @@ status: check
 # Get the IP address of a VM via QEMU guest agent
 get-ip vmid: check
     #!/usr/bin/env bash
+    set -euo pipefail
     ssh {{ ssh_target }} \
         "{{ sudo }} qm guest cmd {{ vmid }} network-get-interfaces" \
         | jq -r '.[] | select(.name != "lo") | ."ip-addresses"[] | select(."ip-address-type" == "ipv4") | ."ip-address"'
@@ -220,6 +216,7 @@ get-ips: check
 [private]
 _print-role-ips role label:
     #!/usr/bin/env bash
+    set -euo pipefail
     echo "{{ label }}:"
     while IFS= read -r vmid; do
         name=$(ssh {{ ssh_target }} "{{ sudo }} qm config $vmid" | grep -oP '^name:\s*\K.*' || echo "?")
@@ -234,6 +231,7 @@ _print-role-ips role label:
 # Snapshot all VMs — disk-consistent only; VMs remain running (no --vmstate)
 snapshot-all name="pre-change": check
     #!/usr/bin/env bash
+    set -euo pipefail
     while IFS= read -r vmid; do
         echo "Snapshotting VM $vmid as {{ name }}..."
         just _ssh "qm snapshot $vmid {{ name }} --description 'automated snapshot'"
@@ -242,6 +240,7 @@ snapshot-all name="pre-change": check
 # Rollback all VMs to a snapshot
 rollback-all name="pre-change": check
     #!/usr/bin/env bash
+    set -euo pipefail
     while IFS= read -r vmid; do
         echo "Rolling back VM $vmid to {{ name }}..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
