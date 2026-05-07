@@ -88,7 +88,7 @@ _create-vm-group count role name_prefix cores memory disk:
     set -euo pipefail
     prefix="{{ name_prefix }}"
     prefix="${prefix//_/-}"
-    base=$(just _vmids-by-tag "{{ role }}" | wc -l | xargs)
+    base=$(just _vmids-by-tag "{{ role }}" "{{ current_cluster }}" | wc -l | xargs)
     for i in $(seq 1 {{ count }}); do
         vmid=$(just next-id)
         name=$(printf "%s-%02d" "$prefix" $((base + i)))
@@ -120,7 +120,7 @@ start-vms: check
     while IFS= read -r vmid; do
         echo "Starting VM $vmid..."
         just _ssh "qm start $vmid" || echo "VM $vmid may already be running"
-    done < <(just _vmids-by-tag "talos")
+    done < <(just _vmids-by-tag {{ current_cluster }})
 
 # Stop all Talos VMs in the current cluster
 stop-vms: check
@@ -160,7 +160,6 @@ _vmids-by-tag +tags:
     #!/usr/bin/env bash
     set -euo pipefail
     [[ -n "{{ tags }}" ]] || { echo "error: _vmids-by-tag requires at least one tag"; exit 1; }
-    echo "Getting all VMs tagged {{ tags }}..." >&2
     ssh {{ ssh_target }} bash <<'REMOTE'
     for vmid in $({{ sudo }} qm list | tail -n+2 | awk '{print $1}'); do
         vm_tags=$({{ sudo }} qm config "$vmid" | grep -oP '^tags:\s*\K.*' || true)
@@ -173,11 +172,11 @@ _vmids-by-tag +tags:
 
 # Count existing control plane nodes
 count-cp: check
-    just _vmids-by-tag "controlplane" | wc -l | xargs
+    just _vmids-by-tag "controlplane" {{ current_cluster }} | wc -l | xargs
 
 # Count existing worker nodes
 count-workers: check
-    just _vmids-by-tag "worker" | wc -l | xargs
+    just _vmids-by-tag "worker" {{ current_cluster }} | wc -l | xargs
 
 # List all Talos-tagged VMs on the host
 list-vms: check
@@ -213,7 +212,7 @@ get-ip vmid: check
     set -euo pipefail
     ssh {{ ssh_target }} \
         "{{ sudo }} qm guest cmd {{ vmid }} network-get-interfaces" \
-        | jq -r '.[] | select(.name != "lo") | ."ip-addresses"[] | select(."ip-address-type" == "ipv4") | ."ip-address"'
+        | jq -r '.[] | select(.name != "lo") | ."ip-addresses"[]? | select(."ip-address-type" == "ipv4") | ."ip-address"'
 
 # Get IPs for all cluster VMs
 get-ips: check
@@ -226,10 +225,35 @@ _print-role-ips role label:
     set -euo pipefail
     echo "{{ label }}:"
     while IFS= read -r vmid; do
-        name=$(ssh {{ ssh_target }} "{{ sudo }} qm config $vmid" | grep -oP '^name:\s*\K.*' || echo "?")
-        ip=$(just get-ip "$vmid" 2>/dev/null || echo "unavailable")
+        name=$(ssh -n {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} qm config $vmid" | grep -oP '^name:\s*\K.*' || echo "?")
+        ip=$(ssh -n {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} qm guest cmd $vmid network-get-interfaces" \
+            | jq -r '.[] | select(.name != "lo") | ."ip-addresses"[]? | select(."ip-address-type" == "ipv4") | ."ip-address"' 2>/dev/null || echo "unavailable")
         echo "  $name ($vmid): $ip"
-    done < <(just _vmids-by-tag "{{ role }}")
+    done < <(just _vmids-by-tag "{{ role }}" "{{ current_cluster }}")
+
+# Return comma-separated IPs for all control plane VMs (e.g. for talosctl --nodes)
+get-cp-ips: check
+    just _role-ip-list "controlplane"
+
+# Return comma-separated IPs for all worker VMs (e.g. for talosctl --nodes)
+get-worker-ips: check
+    just _role-ip-list "worker"
+
+[private]
+_role-ip-list role:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ips=()
+    while IFS= read -r vmid; do
+        ip=$(ssh -n {{ ssh_opts }} {{ ssh_target }} \
+            "{{ sudo }} qm guest cmd $vmid network-get-interfaces" 2>/dev/null \
+            | jq -r '.[] | select(.name != "lo") | ."ip-addresses"[]? | select(."ip-address-type" == "ipv4") | ."ip-address"' \
+            || true)
+        if [[ -n "$ip" ]]; then
+            ips+=("$ip")
+        fi
+    done < <(just _vmids-by-tag "{{ role }}" "{{ current_cluster }}")
+    (IFS=,; printf '%s\n' "${ips[*]}")
 
 # -----------------------------
 # Snapshots
