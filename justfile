@@ -12,6 +12,8 @@ pve_user        := env('PVE_USER', '')
 current_cluster := env('TALOS_CLUSTER', '')
 sudo            := if pve_user == "root" { "" } else { "sudo" }
 ssh_target      := pve_user + "@" + pve_host
+ctl_path        := "/tmp/proxmox-ctl-" + pve_user + "@" + pve_host
+ssh_opts        := "-o ControlMaster=auto -o ControlPath=" + ctl_path + " -o ControlPersist=20s"
 
 # -----------------------------
 # VM defaults
@@ -53,7 +55,7 @@ check:
 
 [private]
 _ssh +cmd:
-    ssh {{ ssh_target }} {{ sudo }} {{ cmd }}
+    ssh -n {{ ssh_opts }} {{ ssh_target }} {{ sudo }} {{ cmd }}
 
 # -----------------------------
 # VM lifecycle
@@ -105,7 +107,7 @@ _create-vm vmid name cores memory disk role:
     just _ssh "qm create {{ vmid }} --name {{ name }} --tags talos,{{ role }},{{ current_cluster }} --cpu host --cores {{ cores }} --memory {{ memory }} --machine q35 --bios ovmf --scsihw virtio-scsi-pci --net0 virtio,bridge={{ talos_bridge }} --ostype l26 --agent enabled=1"
     just _ssh "qm set {{ vmid }} --efidisk0 {{ talos_storage }}:0,efitype=4m,pre-enrolled-keys=0"
     just _ssh "qm importdisk {{ vmid }} {{ talos_image }} {{ talos_storage }}"
-    imported_disk=$(ssh {{ ssh_target }} "{{ sudo }} qm config {{ vmid }}" | grep -oP '^unused\d+:\s*\K\S+')
+    imported_disk=$(ssh {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} qm config {{ vmid }}" | grep -oP '^unused\d+:\s*\K\S+')
     just _ssh "qm set {{ vmid }} --scsi0 $imported_disk"
     just _ssh "qm set {{ vmid }} --boot order=scsi0"
     just _ssh "qm resize {{ vmid }} scsi0 {{ disk }}G"
@@ -133,12 +135,12 @@ stop-vms: check
 destroy-vms: check
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Destroying all VMs tagged talos+{{ current_cluster }}..."
+    echo "Destroying all VMs tagged {{ current_cluster }}..."
     while IFS= read -r vmid; do
         echo "  destroying $vmid..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
         just _ssh "qm destroy $vmid --purge" 2>/dev/null || true
-    done < <(just _vmids-by-tag "talos")
+    done < <(just _vmids-by-tag {{ current_cluster }})
 
 # Resize a VM's primary disk
 resize-disk vmid additional_gb: check
@@ -158,10 +160,10 @@ _vmids-by-tag +tags:
     #!/usr/bin/env bash
     set -euo pipefail
     [[ -n "{{ tags }}" ]] || { echo "error: _vmids-by-tag requires at least one tag"; exit 1; }
+    echo "Getting all VMs tagged {{ tags }}..." >&2
     ssh {{ ssh_target }} bash <<'REMOTE'
     for vmid in $({{ sudo }} qm list | tail -n+2 | awk '{print $1}'); do
         vm_tags=$({{ sudo }} qm config "$vmid" | grep -oP '^tags:\s*\K.*' || true)
-        echo "$vm_tags" | grep -q "{{ current_cluster }}" || continue
         for tag in {{ tags }}; do
             echo "$vm_tags" | grep -q "$tag" || continue 2
         done
