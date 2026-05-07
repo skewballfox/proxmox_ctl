@@ -86,7 +86,7 @@ _create-vm-group count role name_prefix cores memory disk:
     set -euo pipefail
     prefix="{{ name_prefix }}"
     prefix="${prefix//_/-}"
-    base=$(just _vmids-by-role "{{ role }}" | wc -l | xargs)
+    base=$(just _vmids-by-tag "{{ role }}" | wc -l | xargs)
     for i in $(seq 1 {{ count }}); do
         vmid=$(just next-id)
         name=$(printf "%s-%02d" "$prefix" $((base + i)))
@@ -102,9 +102,11 @@ _create-vm vmid name cores memory disk role:
         echo "VM {{ vmid }} ({{ name }}) already exists, skipping"
         exit 0
     fi
-    just _ssh "qm create {{ vmid }} --name {{ name }} --tags talos,{{ role }},{{ current_cluster }} --cpu host --cores {{ cores }} --memory {{ memory }} --scsihw virtio-scsi-pci --net0 virtio,bridge={{ talos_bridge }} --ostype l26 --agent enabled=1"
+    just _ssh "qm create {{ vmid }} --name {{ name }} --tags talos,{{ role }},{{ current_cluster }} --cpu host --cores {{ cores }} --memory {{ memory }} --machine q35 --bios ovmf --scsihw virtio-scsi-pci --net0 virtio,bridge={{ talos_bridge }} --ostype l26 --agent enabled=1"
+    just _ssh "qm set {{ vmid }} --efidisk0 {{ talos_storage }}:0,efitype=4m,pre-enrolled-keys=0"
     just _ssh "qm importdisk {{ vmid }} {{ talos_image }} {{ talos_storage }}"
-    just _ssh "qm set {{ vmid }} --scsi0 {{ talos_storage }}:vm-{{ vmid }}-disk-0"
+    imported_disk=$(ssh {{ ssh_target }} "{{ sudo }} qm config {{ vmid }}" | grep -oP '^unused\d+:\s*\K\S+')
+    just _ssh "qm set {{ vmid }} --scsi0 $imported_disk"
     just _ssh "qm set {{ vmid }} --boot order=scsi0"
     just _ssh "qm resize {{ vmid }} scsi0 {{ disk }}G"
     echo "Created VM {{ name }} ({{ vmid }})"
@@ -116,7 +118,7 @@ start-vms: check
     while IFS= read -r vmid; do
         echo "Starting VM $vmid..."
         just _ssh "qm start $vmid" || echo "VM $vmid may already be running"
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
 
 # Stop all Talos VMs in the current cluster
 stop-vms: check
@@ -125,17 +127,18 @@ stop-vms: check
     while IFS= read -r vmid; do
         echo "Stopping VM $vmid..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
 
-# Destroy all Talos VMs in the current cluster (stop + delete + purge disks)
+# Destroy all Talos VMs in cluster TALOS_CLUSTER (stop + delete + purge disks)
 destroy-vms: check
     #!/usr/bin/env bash
     set -euo pipefail
+    echo "Destroying all VMs tagged talos+{{ current_cluster }}..."
     while IFS= read -r vmid; do
-        echo "Destroying VM $vmid..."
+        echo "  destroying $vmid..."
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
         just _ssh "qm destroy $vmid --purge" 2>/dev/null || true
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
 
 # Resize a VM's primary disk
 resize-disk vmid additional_gb: check
@@ -149,28 +152,30 @@ resize-disk vmid additional_gb: check
 next-id: check
     just _ssh "pvesh get /cluster/nextid"
 
-# List VMIDs in the current cluster; pass a role tag to filter (omit for all cluster VMs)
+# List VMIDs whose tags include current_cluster AND all given tags (at least one required)
 [private]
-_vmids-by-role role="":
+_vmids-by-tag +tags:
     #!/usr/bin/env bash
     set -euo pipefail
+    [[ -n "{{ tags }}" ]] || { echo "error: _vmids-by-tag requires at least one tag"; exit 1; }
     ssh {{ ssh_target }} bash <<'REMOTE'
     for vmid in $({{ sudo }} qm list | tail -n+2 | awk '{print $1}'); do
-        tags=$({{ sudo }} qm config "$vmid" | grep -oP '^tags:\s*\K.*' || true)
-        if echo "$tags" | grep -q "{{ current_cluster }}"; then
-            [[ -z "{{ role }}" ]] || echo "$tags" | grep -q "{{ role }}" || continue
-            echo "$vmid"
-        fi
+        vm_tags=$({{ sudo }} qm config "$vmid" | grep -oP '^tags:\s*\K.*' || true)
+        echo "$vm_tags" | grep -q "{{ current_cluster }}" || continue
+        for tag in {{ tags }}; do
+            echo "$vm_tags" | grep -q "$tag" || continue 2
+        done
+        echo "$vmid"
     done
     REMOTE
 
 # Count existing control plane nodes
 count-cp: check
-    just _vmids-by-role "controlplane" | wc -l | xargs
+    just _vmids-by-tag "controlplane" | wc -l | xargs
 
 # Count existing worker nodes
 count-workers: check
-    just _vmids-by-role "worker" | wc -l | xargs
+    just _vmids-by-tag "worker" | wc -l | xargs
 
 # List all Talos-tagged VMs on the host
 list-vms: check
@@ -198,7 +203,7 @@ status: check
         name=$(echo "$info" | grep -oP '^name:\s*\K.*' || echo "?")
         status=$(echo "$info" | grep -oP '^status:\s*\K.*' || echo "?")
         printf "%-8s %-20s %-10s\n" "$vmid" "$name" "$status"
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
 
 # Get the IP address of a VM via QEMU guest agent
 get-ip vmid: check
@@ -222,7 +227,7 @@ _print-role-ips role label:
         name=$(ssh {{ ssh_target }} "{{ sudo }} qm config $vmid" | grep -oP '^name:\s*\K.*' || echo "?")
         ip=$(just get-ip "$vmid" 2>/dev/null || echo "unavailable")
         echo "  $name ($vmid): $ip"
-    done < <(just _vmids-by-role "{{ role }}")
+    done < <(just _vmids-by-tag "{{ role }}")
 
 # -----------------------------
 # Snapshots
@@ -235,7 +240,7 @@ snapshot-all name="pre-change": check
     while IFS= read -r vmid; do
         echo "Snapshotting VM $vmid as {{ name }}..."
         just _ssh "qm snapshot $vmid {{ name }} --description 'automated snapshot'"
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
 
 # Rollback all VMs to a snapshot
 rollback-all name="pre-change": check
@@ -246,4 +251,4 @@ rollback-all name="pre-change": check
         just _ssh "qm stop $vmid --skiplock" 2>/dev/null || true
         just _ssh "qm rollback $vmid {{ name }}"
         just _ssh "qm start $vmid"
-    done < <(just _vmids-by-role)
+    done < <(just _vmids-by-tag "talos")
