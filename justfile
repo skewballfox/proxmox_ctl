@@ -14,13 +14,15 @@ sudo            := if pve_user == "root" { "" } else { "sudo" }
 ssh_target      := pve_user + "@" + pve_host
 ctl_path        := "/tmp/proxmox-ctl-" + pve_user + "@" + pve_host
 ssh_opts        := "-o ControlMaster=auto -o ControlPath=" + ctl_path + " -o ControlPersist=20s"
+storage_cache   := "/tmp/proxmox-storage-" + pve_user + "@" + pve_host
 
 # -----------------------------
 # VM defaults
 # -----------------------------
 
 talos_version := env('TALOS_VERSION', '') || '1.13.0'
-talos_storage := env('TALOS_STORAGE', '') || 'local-lvm'
+talos_url := env('TALOS_IMAGE_URL', '') || 'https://factory.talos.dev/image/3e1b2c3ef982e30932e0b669a9922e1a65d373f65e93640cd8c444f81e47352e/v' + talos_version + '/metal-amd64.qcow2'
+talos_storage := env('TALOS_STORAGE', '')
 talos_bridge  := env('TALOS_BRIDGE',  '') || 'vmbr0'
 talos_image   := env('TALOS_IMAGE',   '') || '/var/lib/vz/template/qcow2/talos-' + talos_version + '.qcow2'
 
@@ -30,24 +32,35 @@ cp_memory := env('TALOS_CP_MEMORY', '') || '4096'
 cp_disk   := env('TALOS_CP_DISK',   '') || '50'
 
 # Worker defaults
-worker_cores  := env('TALOS_WORKER_CORES',  '') || '4'
-worker_memory := env('TALOS_WORKER_MEMORY', '') || '16384'
-worker_disk   := env('TALOS_WORKER_DISK',   '') || '100'
+worker_cores  := env('TALOS_WORKER_CORES',  '') || '96'
+worker_memory := env('TALOS_WORKER_MEMORY', '') || '91442'
+worker_disk   := env('TALOS_WORKER_DISK',   '') || '300'
 
 # -----------------------------
 # Preflight
 # -----------------------------
 
-# Validate required env vars and tool dependencies (used as a guard by other recipes)
+# Validate required env vars, local tools, and remote Proxmox prerequisites
 check:
     #!/usr/bin/env bash
     set -euo pipefail
+    [ -S "{{ ctl_path }}" ] && exit 0
+
     errors=0
     [ -n "{{ pve_host }}" ]        || { echo "PVE_HOST is not set";       errors=$((errors+1)); }
     [ -n "{{ pve_user }}" ]        || { echo "PVE_USER is not set";       errors=$((errors+1)); }
     [ -n "{{ current_cluster }}" ] || { echo "TALOS_CLUSTER is not set";  errors=$((errors+1)); }
     command -v jq &>/dev/null      || { echo "jq not found (required for get-ip / get-ips)"; errors=$((errors+1)); }
     [ $errors -eq 0 ] || { echo "Set missing values in .env or export them — see .env.example"; exit 1; }
+
+    if ! ssh -n {{ ssh_opts }} {{ ssh_target }} "ip link show {{ talos_bridge }}" &>/dev/null; then
+        echo "Bridge '{{ talos_bridge }}' not found on {{ pve_host }}. Available bridges:"
+        ssh -n {{ ssh_opts }} {{ ssh_target }} "ip link show type bridge" 2>/dev/null \
+            | grep -oP '^\d+:\s*\K[^:@]+' | sed 's/ //g; s/^/  /'
+        echo "Set TALOS_BRIDGE in .env to one of the above."
+        exit 1
+    fi
+    ssh -n {{ ssh_opts }} {{ ssh_target }} "mkdir -p $(dirname '{{ talos_image }}')"
 
 # -----------------------------
 # SSH helper
@@ -56,6 +69,30 @@ check:
 [private]
 _ssh +cmd:
     ssh -n {{ ssh_opts }} {{ ssh_target }} {{ sudo }} {{ cmd }}
+
+# Resolve storage pool: TALOS_STORAGE if set, else auto-detect and cache for the session
+[private]
+_storage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -s "{{ storage_cache }}" ]; then
+        cat "{{ storage_cache }}"
+        exit 0
+    fi
+    [ -S "{{ ctl_path }}" ] || { echo "error: run 'just check' first" >&2; exit 1; }
+    if [ -n "{{ talos_storage }}" ]; then
+        echo "{{ talos_storage }}" > "{{ storage_cache }}"
+        echo "{{ talos_storage }}"
+        exit 0
+    fi
+    active=$(ssh -n {{ ssh_opts }} {{ ssh_target }} "pvesm status | awk 'NR>1 && \$3==\"active\" {print \$1}'")
+    storage=$(echo "$active" | grep -E '^(local-lvm|local-zfs)$' | head -1 || true)
+    if [ -z "$storage" ]; then
+        storage=$(echo "$active" | grep -v '^local$' | head -1 || true)
+    fi
+    storage="${storage:-local}"
+    echo "$storage" > "{{ storage_cache }}"
+    echo "$storage"
 
 # -----------------------------
 # VM lifecycle
@@ -83,7 +120,17 @@ create-worker cores=worker_cores memory=worker_memory disk=worker_disk: check
     just _create-vm-group "1" "worker" "talos-{{ current_cluster }}-worker" "{{ cores }}" "{{ memory }}" "{{ disk }}"
 
 [private]
-_create-vm-group count role name_prefix cores memory disk:
+_ensure-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! ssh -n {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} test -f {{ talos_image }}"; then
+        echo "Talos image not found at {{ talos_image }}, downloading from {{ talos_url }}..."
+        ssh -n {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} wget -O {{ talos_image }} {{ talos_url }}"
+        echo "Download complete."
+    fi
+
+[private]
+_create-vm-group count role name_prefix cores memory disk: _ensure-image
     #!/usr/bin/env bash
     set -euo pipefail
     prefix="{{ name_prefix }}"
@@ -100,13 +147,14 @@ _create-vm-group count role name_prefix cores memory disk:
 _create-vm vmid name cores memory disk role:
     #!/usr/bin/env bash
     set -euo pipefail
+    storage=$(just _storage)
     if just _ssh "qm status {{ vmid }}" &>/dev/null; then
         echo "VM {{ vmid }} ({{ name }}) already exists, skipping"
         exit 0
     fi
     just _ssh "qm create {{ vmid }} --name {{ name }} --tags talos,{{ role }},{{ current_cluster }} --cpu host --cores {{ cores }} --memory {{ memory }} --machine q35 --bios ovmf --scsihw virtio-scsi-pci --net0 virtio,bridge={{ talos_bridge }} --ostype l26 --agent enabled=1"
-    just _ssh "qm set {{ vmid }} --efidisk0 {{ talos_storage }}:0,efitype=4m,pre-enrolled-keys=0"
-    just _ssh "qm importdisk {{ vmid }} {{ talos_image }} {{ talos_storage }}"
+    just _ssh "qm set {{ vmid }} --efidisk0 $storage:0,efitype=4m,pre-enrolled-keys=0"
+    just _ssh "qm importdisk {{ vmid }} {{ talos_image }} $storage"
     imported_disk=$(ssh {{ ssh_opts }} {{ ssh_target }} "{{ sudo }} qm config {{ vmid }}" | grep -oP '^unused\d+:\s*\K\S+')
     just _ssh "qm set {{ vmid }} --scsi0 $imported_disk"
     just _ssh "qm set {{ vmid }} --boot order=scsi0"
